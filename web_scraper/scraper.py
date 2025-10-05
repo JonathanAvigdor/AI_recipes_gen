@@ -1,38 +1,140 @@
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+import os
+import re
+from typing import List, Tuple
+
+# --- Cloud-friendly path: requests + BeautifulSoup ---
+import requests
 from bs4 import BeautifulSoup
 
-def scrape_ica_offers(url: str):
-    """ Scarpes weekly offers from ICA,
-    """
-    driver = webdriver.Chrome()
-    driver.maximize_window()
-    driver.get(url)
-    wait = WebDriverWait(driver, 5)
+# --- Local path: Selenium (optional) ---
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from webdriver_manager.chrome import ChromeDriverManager
+    _HAS_SELENIUM = True
+except Exception:
+    _HAS_SELENIUM = False
 
-    # click cookie consent button
-    agree_button_selector = "button#onetrust-accept-btn-handler"
+PRICE_PAT = re.compile(r"\d{1,3}(?:[.,]\d{1,2})?\s*kr", re.IGNORECASE)
+
+def _clean_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+def _extract_title_and_price(text: str) -> Tuple[str, str]:
+    text = _clean_space(text)
+    price_match = PRICE_PAT.search(text)
+    price = price_match.group(0) if price_match else ""
+    title = text
+    if price:
+        title = (text[:price_match.start()] + text[price_match.end():]).strip(" -:;|,")
+    if len(title) > 140:
+        title = title[:140] + "…"
+    return title, (price or "—")
+
+# -----------------------------
+# Cloud scraper (requests + bs4)
+# -----------------------------
+def _scrape_requests(url: str) -> List[Tuple[str, str]]:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    resp = requests.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    candidates = []
+    for tag in soup.find_all(["article", "li", "div"]):
+        cls = " ".join(tag.get("class") or [])
+        if re.search(r"(offer|product|card|grid|tile|item)", cls, re.IGNORECASE):
+            txt = tag.get_text(separator=" ", strip=True)
+            if PRICE_PAT.search(txt) and len(txt) > 20:
+                candidates.append(txt)
+
+    if not candidates:
+        for tag in soup.find_all(string=PRICE_PAT):
+            block = tag.parent.get_text(separator=" ", strip=True)
+            if len(block) > 20:
+                candidates.append(block)
+
+    seen, clean = set(), []
+    for c in candidates:
+        c2 = _clean_space(c)
+        if c2 not in seen:
+            seen.add(c2)
+            clean.append(c2)
+
+    results: List[Tuple[str, str]] = []
+    for c in clean:
+        title, price = _extract_title_and_price(c)
+        if len(re.sub(r"[^A-Za-zÅÄÖåäöÉéÜüÆæØøß]", "", title)) >= 3:
+            results.append((title, price))
+
+    return results[:60]
+
+# -----------------------------
+# Local scraper (Selenium)
+# -----------------------------
+def _scrape_selenium(url: str) -> List[Tuple[str, str]]:
+    if not _HAS_SELENIUM:
+        return []
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    driver = webdriver.Chrome(ChromeDriverManager().install(), options=options)
     try:
-        button = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, agree_button_selector)))
-        driver.execute_script("arguments[0].click();", button)
-    except:
+        driver.get(url)
+        driver.implicitly_wait(5)
+
+        texts = []
+        elems = driver.find_elements(
+            By.XPATH,
+            "//article|//li|//div[contains(@class,'product') or contains(@class,'offer')]"
+        )
+        if not elems:
+            elems = driver.find_elements(By.XPATH, "//*")
+        for el in elems:
+            try:
+                txt = el.text
+                if PRICE_PAT.search(txt) and len(txt) > 20:
+                    texts.append(txt)
+            except Exception:
+                pass
+
+        seen, blocks = set(), []
+        for t in texts:
+            t2 = _clean_space(t)
+            if t2 not in seen:
+                seen.add(t2)
+                blocks.append(t2)
+
+        results = []
+        for b in blocks:
+            title, price = _extract_title_and_price(b)
+            if len(title) >= 3:
+                results.append((title, price))
+        return results[:60]
+    finally:
+        driver.quit()
+
+# -----------------------------
+# Public API (hybrid)
+# -----------------------------
+def scrape_ica_offers(url: str) -> List[Tuple[str, str]]:
+    """
+    Hybrid scraper:
+      - If RUN_ENV=cloud -> requests+bs4 (Streamlit Cloud safe)
+      - Else try Selenium first, then fallback to requests+bs4
+    """
+    run_env = os.getenv("RUN_ENV", "").lower()
+
+    if run_env == "cloud":
+        return _scrape_requests(url)
+
+    try:
+        data = _scrape_selenium(url)
+        if data:
+            return data
+    except Exception:
         pass
 
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-
-    key = "article > div.offer-card__details-container"
-    key_2 = "article > div.offer-card__image-container > div > span.sr-only"
-
-    product_title = [i.text.replace("\xa0kr. ", "").split(". ")[0] for i in soup.select(key)]
-    new_price = [i.text for i in soup.select(key_2)]
-
-    grocery_offers = list(zip(product_title, new_price))
-
-    driver.quit()
-    return grocery_offers
-
-
+    return _scrape_requests(url)

@@ -1,11 +1,27 @@
+import os
 import streamlit as st
 from web_scraper.scraper import scrape_ica_offers
 from recipe_chain_module.recipe_chain import create_recipe_chain
 from gmail_api.gmail_sender import get_gmail_service, create_message, send_message
 
+# ---- Safe secrets load (works locally & on Cloud) ----
+RUN_ENV = os.environ.get("RUN_ENV", "")
+try:
+    # On Streamlit Cloud this will exist; locally it may not
+    RUN_ENV = st.secrets.get("RUN_ENV", RUN_ENV)
+    # Pass OPENAI key to env for langchain_openai
+    os.environ["OPENAI_API_KEY"] = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+except Exception:
+    pass
+
+# IMPORTANT: write RUN_ENV back to environment so scraper.py can read it
+os.environ["RUN_ENV"] = RUN_ENV or os.environ.get("RUN_ENV", "")
+IS_CLOUD = (os.environ["RUN_ENV"].lower() == "cloud")
+
 st.set_page_config(page_title="AI Recipe Generator", page_icon="🍝", layout="centered")
 st.title("🍝 AI Recipe Generator (ICA Offers)")
-st.caption("Paste your ICA store offers URL, preview deals, generate AI recipes + shopping list, and send to your email.")
+mode_label = "🌐 Cloud mode (requests+bs4)" if IS_CLOUD else "💻 Local mode (Selenium preferred)"
+st.caption(f"Paste your ICA store offers URL, preview deals, generate AI recipes + shopping list, and send to your email.  \n**Mode:** {mode_label}")
 
 # -----------------------------
 # Helpers
@@ -89,30 +105,33 @@ if "offers" in st.session_state and st.session_state["offers"]:
 if st.session_state.get("recipes_text") and st.session_state.get("shopping_list_text"):
     _show_ai_results(st.session_state["recipes_text"], st.session_state["shopping_list_text"])
 
-    # Email sending
+    # Email sending (hide on Cloud where Gmail OAuth won't work)
     user_email_saved = st.session_state.get("user_email", "").strip()
-    if user_email_saved:
-        if st.button("📧 Send to my email"):
-            try:
-                service = get_gmail_service()
-                body = (
-                    "Hi!\n\nHere are your AI-generated recipes and shopping list from ICA offers.\n\n"
-                    "=== Recipes ===\n\n" + st.session_state["recipes_text"] +
-                    "\n\n=== Shopping List ===\n\n" + st.session_state["shopping_list_text"] +
-                    "\n\n— Sent automatically by your AI Recipe Generator"
-                )
-                msg = create_message(
-                    sender="me",
-                    to=user_email_saved,
-                    subject="Your ICA-based recipes & shopping list",
-                    message_text=body
-                )
-                send_message(service, "me", msg)
-                st.success("Email sent! 🎉 Check your inbox.")
-            except Exception as e:
-                st.error(f"Email failed: {e}")
+    if IS_CLOUD:
+        st.info("Email sending is available on local runs. On Streamlit Cloud, Gmail OAuth is disabled.")
     else:
-        st.info("Enter your email in the form above to enable the Send button.")
+        if user_email_saved:
+            if st.button("📧 Send to my email"):
+                try:
+                    service = get_gmail_service()
+                    body = (
+                        "Hi!\n\nHere are your AI-generated recipes and shopping list from ICA offers.\n\n"
+                        "=== Recipes ===\n\n" + st.session_state["recipes_text"] +
+                        "\n\n=== Shopping List ===\n\n" + st.session_state["shopping_list_text"] +
+                        "\n\n— Sent automatically by your AI Recipe Generator"
+                    )
+                    msg = create_message(
+                        sender="me",
+                        to=user_email_saved,
+                        subject="Your ICA-based recipes & shopping list",
+                        message_text=body
+                    )
+                    send_message(service, "me", msg)
+                    st.success("Email sent! 🎉 Check your inbox.")
+                except Exception as e:
+                    st.error(f"Email failed: {e}")
+        else:
+            st.info("Enter your email in the form above to enable the Send button.")
 else:
     if "offers" not in st.session_state or not st.session_state["offers"]:
         st.info("Submit the form to preview offers.")
